@@ -27,21 +27,27 @@
 #include <fluent-bit/flb_error.h>
 #include <fluent-bit/flb_utils.h>
 #include <fluent-bit/flb_input_thread.h>
-#include <mpack/mpack.h>
+#include <msgpack.h>
 #include <stddef.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
 
 #include "fluent-bit/flb_input.h"
 #include "fluent-bit/flb_kafka.h"
 #include "in_kafka.h"
 #include "rdkafka.h"
 
-static int try_json(mpack_writer_t *writer, rd_kafka_message_t *rkm)
+static int try_json(struct flb_input_instance *in, msgpack_packer *mpck, rd_kafka_message_t *rkm)
 {
     int root_type;
     char *buf = NULL;
     size_t bufsize;
     int ret;
+
+    size_t off = 0;
+    msgpack_unpacked result;
+    msgpack_object entry;
 
     ret = flb_pack_json(rkm->payload, rkm->len, &buf, &bufsize, &root_type);
     if (ret) {
@@ -50,78 +56,146 @@ static int try_json(mpack_writer_t *writer, rd_kafka_message_t *rkm)
         }
         return ret;
     }
-    mpack_write_object_bytes(writer, buf, bufsize);
+
+    flb_debug("[in-kafka] rcv payload size: %d\n", bufsize);
+
+    msgpack_unpacked_init(&result);
+
+    while (msgpack_unpack_next(&result, buf, bufsize, &off) == MSGPACK_UNPACK_SUCCESS) {
+        entry = result.data;
+
+        if (entry.type == MSGPACK_OBJECT_MAP) {
+            msgpack_pack_object(mpck, entry);
+        }
+        else if (entry.type == MSGPACK_OBJECT_ARRAY) {
+            msgpack_pack_map(mpck, 1);
+            msgpack_pack_object(mpck, entry);
+        }
+        else {
+            flb_error("[in-kafka] record is not a JSON map or array");
+            msgpack_unpacked_destroy(&result);
+            return -1;
+        }
+    }
+
+    msgpack_unpacked_destroy(&result);
     flb_free(buf);
     return 0;
 }
 
-static void process_message(mpack_writer_t *writer,
-                           rd_kafka_message_t *rkm)
+static int process_message(struct flb_input_instance *in, rd_kafka_message_t *rkm)
 {
-    struct flb_time t;
+    msgpack_packer mp_pck;
+    msgpack_sbuffer mp_sbuf;
+    int ret;
 
-    mpack_write_tag(writer, mpack_tag_array(2));
+    /* Initialize local msgpack buffer */
+    msgpack_sbuffer_init(&mp_sbuf);
+    msgpack_packer_init(&mp_pck, &mp_sbuf, msgpack_sbuffer_write);
 
-    flb_time_get(&t);
-    flb_time_append_to_mpack(writer, &t, 0);
+    msgpack_pack_array(&mp_pck, 2);
+    flb_pack_time_now(&mp_pck);
 
-    mpack_write_tag(writer, mpack_tag_map(6));
+    msgpack_pack_map(&mp_pck, 6);
 
-    mpack_write_cstr(writer, "topic");
+    msgpack_pack_str(&mp_pck, 5);
+    msgpack_pack_str_body(&mp_pck, "topic", 5);
     if (rkm->rkt) {
-        mpack_write_cstr(writer, rd_kafka_topic_name(rkm->rkt));
+        const char *rktopic = rd_kafka_topic_name(rkm->rkt);
+        msgpack_pack_str(&mp_pck, strlen(rktopic));
+        msgpack_pack_str_body(&mp_pck, rktopic, strlen(rktopic));
     } else {
-        mpack_write_nil(writer);
+        msgpack_pack_nil(&mp_pck);
     }
 
-    mpack_write_cstr(writer, "partition");
-    mpack_write_i32(writer, rkm->partition);
+    msgpack_pack_str(&mp_pck, 9);
+    msgpack_pack_str_body(&mp_pck, "partition", 9);
+    msgpack_pack_int32(&mp_pck, rkm->partition);
 
-    mpack_write_cstr(writer, "offset");
-    mpack_write_i64(writer, rkm->offset);
+    msgpack_pack_str(&mp_pck, 6);
+    msgpack_pack_str_body(&mp_pck, "offset", 6);
+    msgpack_pack_int64(&mp_pck, rkm->offset);
 
-    mpack_write_cstr(writer, "error");
+    msgpack_pack_str(&mp_pck, 5);
+    msgpack_pack_str_body(&mp_pck, "error", 5);
     if (rkm->err) {
-        mpack_write_cstr(writer, rd_kafka_message_errstr(rkm));
+        const char *rkerr = rd_kafka_message_errstr(rkm);
+        msgpack_pack_str(&mp_pck, strlen(rkerr));
+        msgpack_pack_str_body(&mp_pck, rkerr, strlen(rkerr));
     } else {
-        mpack_write_nil(writer);
+        msgpack_pack_nil(&mp_pck);
     }
 
-    mpack_write_cstr(writer, "key");
+    msgpack_pack_str(&mp_pck, 3);
+    msgpack_pack_str_body(&mp_pck, "key", 3);
     if (rkm->key) {
-        mpack_write_str(writer, rkm->key, rkm->key_len);
+        msgpack_pack_str(&mp_pck, rkm->key_len);
+        msgpack_pack_str_body(&mp_pck, rkm->key, rkm->key_len);
     } else {
-        mpack_write_nil(writer);
+        msgpack_pack_nil(&mp_pck);
     }
 
-    mpack_write_cstr(writer, "payload");
+    msgpack_pack_str(&mp_pck, 7);
+    msgpack_pack_str_body(&mp_pck, "payload", 7);
     if (rkm->payload) {
-        if (try_json(writer, rkm)) {
-            mpack_write_str(writer, rkm->payload, rkm->len);
+        if (try_json(in, &mp_pck, rkm)) {
+            msgpack_pack_str(&mp_pck, rkm->len);
+            msgpack_pack_str_body(&mp_pck, rkm->payload, rkm->len);
         }
     } else {
-        mpack_write_nil(writer);
+        msgpack_pack_nil(&mp_pck);
     }
 
-    mpack_writer_flush_message(writer);
+    ret = flb_input_chunk_append_raw(in, NULL, 0, mp_sbuf.data,
+                                         mp_sbuf.size);
+
+    if (ret < 0)
+        flb_warn("[in_kafka] flb_input_chunk_append_raw failed of size %u", mp_sbuf.size);
+
+    msgpack_sbuffer_destroy(&mp_sbuf);
+
+    return ret;
 }
 
-static void in_kafka_callback(int write_fd, void *data)
+static int in_kafka_collect(struct flb_input_instance *in,
+                            struct flb_config *config, void *in_context)
 {
-    struct flb_input_thread *it = data;
-    struct flb_in_kafka_config *ctx = data - offsetof(struct flb_in_kafka_config, it);
-    mpack_writer_t *writer = &ctx->it.writer;
+    struct flb_in_kafka_config *ctx = in_context;
+    int i, msgn, wPoll, pTime;
 
-    while (!flb_input_thread_exited(it)) {
-        rd_kafka_message_t *rkm = rd_kafka_consumer_poll(ctx->kafka.rk, 500);
+    msgn = 0;
+    wPoll = 1;
+    pTime = ctx->batch_size + 10;
 
-        if (rkm) {
-            process_message(writer, rkm);
-            fflush(ctx->it.write_file);
+    while (wPoll) {
+        pTime--;
+        rd_kafka_message_t *rkm = rd_kafka_consumer_poll(ctx->kafka.rk, 50);
+        if (!rkm)
+            continue;
+
+        if (rkm->err) {
             rd_kafka_message_destroy(rkm);
-            rd_kafka_commit(ctx->kafka.rk, NULL, 0);
+            continue;
         }
+
+        ctx->rkm_batch[msgn] = rkm;
+        msgn++;
+
+        if(pTime <= 0 || msgn >= ctx->batch_size)
+          wPoll = 0;
     }
+
+    if(msgn) {
+         for(i=0; i != msgn; i++) {
+            rd_kafka_message_t *rkmm = ctx->rkm_batch[i];
+            /* commit offsets only if chunk was appended successfully */
+            if(!process_message(in, rkmm))
+                rd_kafka_commit(ctx->kafka.rk, NULL, 0);
+            rd_kafka_message_destroy(rkmm);
+         }
+    }
+
+    return 0;
 }
 
 /* Initialize plugin */
@@ -130,7 +204,9 @@ static int in_kafka_init(struct flb_input_instance *ins,
 {
     int ret;
     const char *conf;
+    struct timespec tm;
     struct flb_in_kafka_config *ctx;
+
     rd_kafka_conf_t *kafka_conf = NULL;
     rd_kafka_topic_partition_list_t *kafka_topics = NULL;
     rd_kafka_resp_err_t err;
@@ -138,10 +214,13 @@ static int in_kafka_init(struct flb_input_instance *ins,
     (void) data;
 
     /* Allocate space for the configuration context */
-    ctx = flb_malloc(sizeof(struct flb_in_kafka_config));
+    ctx = flb_calloc(1, sizeof(struct flb_in_kafka_config));
     if (!ctx) {
+        flb_plg_error(ins, "flb_calloc failed: %s", strerror(errno));
         return -1;
     }
+    ctx->ins = ins;
+
     kafka_conf = flb_kafka_conf_create(&ctx->kafka, &ins->properties, 1);
     if (!kafka_conf) {
         flb_plg_error(ins, "Could not initialize kafka config object");
@@ -176,27 +255,29 @@ static int in_kafka_init(struct flb_input_instance *ins,
     rd_kafka_topic_partition_list_destroy(kafka_topics);
     kafka_topics = NULL;
 
-    /* create worker thread */
-    ret = flb_input_thread_init(&ctx->it, in_kafka_callback, &ctx->it);
-    if (ret) {
-        flb_errno();
-        flb_plg_error(ins, "Could not initialize worker thread");
+    ctx->batch_size = BATCH_SIZE;
+    ctx->rkm_batch = flb_malloc(sizeof(rd_kafka_message_t *) * ctx->batch_size);
+    if (!ctx->rkm_batch) {
+        flb_plg_error(ins, "flb_calloc failed: %s", strerror(errno));
         goto init_error;
     }
 
-    /* Set the context */
-    flb_input_set_context(ins, &ctx->it);
+    /* interval settings */
+    tm.tv_sec  = 1;
+    tm.tv_nsec = 0;
+//    tm.tv_nsec = 100000000;
 
-    /* Collect upon data available on the pipe read fd */
-    ret = flb_input_set_collector_event(ins,
-                                        flb_input_thread_collect,
-                                        ctx->it.read,
-                                        config);
-    if (ret == -1) {
-        flb_plg_error(ins, "Could not set collector for thread dummy input plugin");
+    flb_input_set_context(ins, ctx);
+    ret = flb_input_set_collector_time(ins,
+                                       in_kafka_collect,
+                                       tm.tv_sec,
+                                       tm.tv_nsec, config);
+    if (ret < 0) {
+        flb_plg_error(ins, "Could not set collector for kafka input plugin");
         goto init_error;
     }
-    ctx->it.coll_fd = ret;
+
+    ctx->c_id = ret;
 
     return 0;
 
@@ -215,21 +296,31 @@ init_error:
     return -1;
 }
 
+static void in_kafka_pause(void *data, struct flb_config *config)
+{
+    struct flb_in_kafka_config *ctx = data;
+    flb_debug("[in_kafka] pausing endpoint %d", ctx->c_id);
+    flb_input_collector_pause(ctx->c_id, ctx->ins);
+}
+
+static void in_kafka_resume(void *data, struct flb_config *config)
+{
+    struct flb_in_kafka_config *ctx = data;
+    flb_debug("[in_kafka] resuming endpoint %d", ctx->c_id);
+    flb_input_collector_resume(ctx->c_id, ctx->ins);
+}
+
 /* Cleanup serial input */
 static int in_kafka_exit(void *in_context, struct flb_config *config)
 {
-    struct flb_input_thread *it;
-    struct flb_in_kafka_config *ctx;
+    struct flb_in_kafka_config *ctx = in_context;
 
-    if (!in_context) {
-        return 0;
-    }
+    flb_debug("[in_kafka] %d exiting..", ctx->c_id);
 
-    it = in_context;
-    ctx = (in_context - offsetof(struct flb_in_kafka_config, it));
-    flb_input_thread_destroy(it, ctx->ins);
+    rd_kafka_consumer_close(ctx->kafka.rk);
     rd_kafka_destroy(ctx->kafka.rk);
     flb_free(ctx->kafka.brokers);
+    flb_free(ctx->rkm_batch);
     flb_free(ctx);
 
     return 0;
@@ -241,7 +332,10 @@ struct flb_input_plugin in_kafka_plugin = {
     .description  = "Kafka consumer input plugin",
     .cb_init      = in_kafka_init,
     .cb_pre_run   = NULL,
-    .cb_collect   = flb_input_thread_collect,
+    .cb_collect   = in_kafka_collect,
     .cb_flush_buf = NULL,
+    .cb_pause     = in_kafka_pause,
+    .cb_resume    = in_kafka_resume,
     .cb_exit      = in_kafka_exit
 };
+

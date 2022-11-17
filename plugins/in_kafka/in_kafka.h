@@ -23,13 +23,19 @@
 
 #include <fluent-bit/flb_config.h>
 #include <fluent-bit/flb_input.h>
-#include <fluent-bit/flb_input_thread.h>
 #include <fluent-bit/flb_kafka.h>
+
+#define BATCH_SIZE 1024
 
 struct flb_in_kafka_config {
     struct flb_kafka kafka;
+
+    int batch_size;
+    rd_kafka_message_t **rkm_batch;
+
+    int c_id;
     struct flb_input_instance *ins;
-    struct flb_input_thread it;
 };
 
 #endif
+
