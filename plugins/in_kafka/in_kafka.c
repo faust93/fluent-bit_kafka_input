@@ -169,7 +169,7 @@ static int in_kafka_collect(struct flb_input_instance *in,
 
     while (wPoll) {
         pTime--;
-        rd_kafka_message_t *rkm = rd_kafka_consumer_poll(ctx->kafka.rk, 50);
+        rd_kafka_message_t *rkm = rd_kafka_consumer_poll(ctx->kafka.rk, 100);
         if (!rkm)
             continue;
 
@@ -185,12 +185,13 @@ static int in_kafka_collect(struct flb_input_instance *in,
           wPoll = 0;
     }
 
+    rd_kafka_commit(ctx->kafka.rk, NULL, 0);
+
     if(msgn) {
          for(i=0; i != msgn; i++) {
             rd_kafka_message_t *rkmm = ctx->rkm_batch[i];
-            /* commit offsets only if chunk was appended successfully */
-            if(!process_message(in, rkmm))
-                rd_kafka_commit(ctx->kafka.rk, NULL, 0);
+            if(process_message(in, rkmm) !=0)
+                flb_plg_error(in, "unable to process kafka ingress message");
             rd_kafka_message_destroy(rkmm);
          }
     }
